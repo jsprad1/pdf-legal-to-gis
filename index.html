@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF-to-GIS Boundary Converter</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+    <style>
+        * { box-sizing: border-box; margin: 0; }
+        body { font-family: system-ui, -apple-system, sans-serif; height: 100vh; display: flex; flex-direction: column; }
+
+        header { background: #1e293b; color: white; padding: 0.75rem 1.5rem; display: flex; align-items: center; justify-content: space-between; }
+        header h1 { font-size: 1.1rem; font-weight: 600; }
+
+        .toolbar { display: flex; align-items: center; gap: 1rem; }
+
+        .upload-btn { background: #3b82f6; color: white; border: none; padding: 0.5rem 1rem; border-radius: 6px; cursor: pointer; font-weight: 500; font-size: 0.875rem; }
+        .upload-btn:hover { background: #2563eb; }
+
+        .download-btns { display: flex; gap: 0.5rem; }
+        .download-btns button { background: #10b981; color: white; border: none; padding: 0.4rem 0.75rem; border-radius: 4px; cursor: pointer; font-size: 0.8rem; font-weight: 500; display: none; }
+        .download-btns button:hover { background: #059669; }
+
+        .status { font-size: 0.8rem; color: #94a3b8; }
+
+        #map { flex: 1; }
+
+        .drop-overlay { display: none; position: fixed; inset: 0; background: rgba(30,41,59,0.85); z-index: 9999; align-items: center; justify-content: center; }
+        .drop-overlay.active { display: flex; }
+        .drop-box { border: 3px dashed #60a5fa; border-radius: 16px; padding: 3rem 4rem; color: white; font-size: 1.25rem; text-align: center; }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>PDF-to-GIS Boundary Converter</h1>
+    <div class="toolbar">
+        <span class="status" id="status"></span>
+        <div class="download-btns" id="downloads">
+            <button onclick="downloadResult('geojson')" id="btn-geojson">GeoJSON</button>
+            <button onclick="downloadResult('shp')" id="btn-shp">Shapefile</button>
+        </div>
+        <button class="upload-btn" onclick="document.getElementById('fileInput').click()">Upload PDF</button>
+        <input type="file" id="fileInput" hidden accept="application/pdf">
+    </div>
+</header>
+
+<div id="map"></div>
+
+<div class="drop-overlay" id="dropOverlay">
+    <div class="drop-box">Drop PDF here</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map').setView([27.38, -80.44], 11);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap'
+}).addTo(map);
+
+const resultLayer = L.featureGroup().addTo(map);
+const colors = ['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6','#e67e22','#1abc9c','#e84393','#00b894','#6c5ce7'];
+let currentJobId = null;
+
+// File input
+document.getElementById('fileInput').onchange = e => uploadFile(e.target.files[0]);
+
+// Drag and drop
+document.body.addEventListener('dragover', e => { e.preventDefault(); document.getElementById('dropOverlay').classList.add('active'); });
+document.getElementById('dropOverlay').addEventListener('dragleave', () => document.getElementById('dropOverlay').classList.remove('active'));
+document.getElementById('dropOverlay').addEventListener('drop', e => {
+    e.preventDefault();
+    document.getElementById('dropOverlay').classList.remove('active');
+    if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
+});
+
+async function uploadFile(file) {
+    if (!file || !file.name.toLowerCase().endsWith('.pdf')) {
+        setStatus('Please select a PDF file');
+        return;
+    }
+
+    setStatus('Uploading...');
+    resultLayer.clearLayers();
+    hideDownloads();
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const res = await fetch('/api/upload', { method: 'POST', body: formData });
+    const { job_id } = await res.json();
+    currentJobId = job_id;
+    setStatus('Processing: ' + file.name);
+    pollJob(job_id);
+}
+
+function pollJob(jobId) {
+    const timer = setInterval(async () => {
+        const res = await fetch('/api/status/' + jobId);
+        const data = await res.json();
+
+        if (data.status === 'completed') {
+            clearInterval(timer);
+            setStatus(data.geojson.features.length + ' parcels found');
+            showResult(data.geojson);
+            showDownloads();
+        } else if (data.status === 'failed') {
+            clearInterval(timer);
+            setStatus('Failed: ' + (data.error || 'unknown error'));
+        }
+    }, 1000);
+}
+
+function showResult(gj) {
+    resultLayer.clearLayers();
+    gj.features.forEach((feat, i) => {
+        const isExclusion = feat.properties.exclusion;
+        const color = isExclusion ? '#999' : colors[i % colors.length];
+        L.geoJSON(feat, {
+            style: {
+                color: color, weight: 3,
+                fillColor: color, fillOpacity: isExclusion ? 0.1 : 0.2,
+                dashArray: isExclusion ? '6 4' : null
+            },
+            onEachFeature: (f, l) => {
+                const p = f.properties;
+                l.bindPopup('<b>' + (p.name || 'Boundary') + '</b><br>' +
+                    p.parcel + '<br>' +
+                    'Type: ' + p.desc_type + '<br>' +
+                    'Section: ' + (p.section || '') +
+                    (p.exclusion ? '<br><em>Exclusion</em>' : ''));
+            }
+        }).addTo(resultLayer);
+    });
+    if (resultLayer.getLayers().length) map.fitBounds(resultLayer.getBounds().pad(0.15));
+}
+
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+function showDownloads() { document.querySelectorAll('#downloads button').forEach(b => b.style.display = 'inline-block'); }
+function hideDownloads() { document.querySelectorAll('#downloads button').forEach(b => b.style.display = 'none'); }
+function downloadResult(type) { if (currentJobId) window.open('/api/download/' + currentJobId + '/' + type); }
+</script>
+
+</body>
+</html>
