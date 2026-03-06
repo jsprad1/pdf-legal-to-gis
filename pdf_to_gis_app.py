@@ -1504,7 +1504,10 @@ def cli_process(pdf_path_str: str):
                 if flagged:
                     print(f"    {len(flagged)} leg(s) flagged")
                     for l in flagged:
-                        print(f"      Leg {l['leg_num']}: conf={l['confidence']:.2f} — {', '.join(l['flags'][:2])}")
+                        flags_str = ', '.join(l['flags'][:2])
+                        # Sanitize for Windows console encoding
+                        flags_str = flags_str.encode('ascii', errors='replace').decode('ascii')
+                        print(f"      Leg {l['leg_num']}: conf={l['confidence']:.2f} -- {flags_str}")
                 else:
                     print(f"    All {len(validated)} legs OK")
             validated_path = out_dir / "legs_validated.json"

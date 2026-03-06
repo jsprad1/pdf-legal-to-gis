@@ -60,6 +60,10 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 
 const resultLayer = L.featureGroup().addTo(map);
 const colors = ['#e74c3c','#3498db','#2ecc71','#f39c12','#9b59b6','#e67e22','#1abc9c','#e84393','#00b894','#6c5ce7'];
+
+// Store results client-side for downloads
+let currentGeojson = null;
+let currentShpB64 = null;
 let currentJobId = null;
 
 // File input
@@ -80,18 +84,38 @@ async function uploadFile(file) {
         return;
     }
 
-    setStatus('Uploading...');
+    setStatus('Processing: ' + file.name + '...');
     resultLayer.clearLayers();
     hideDownloads();
+    currentGeojson = null;
+    currentShpB64 = null;
+    currentJobId = null;
 
     const formData = new FormData();
     formData.append('file', file);
 
-    const res = await fetch('/api/upload', { method: 'POST', body: formData });
-    const { job_id } = await res.json();
-    currentJobId = job_id;
-    setStatus('Processing: ' + file.name);
-    pollJob(job_id);
+    try {
+        const res = await fetch('/api/upload', { method: 'POST', body: formData });
+        const data = await res.json();
+
+        if (data.status === 'completed') {
+            // Synchronous response (Vercel mode)
+            currentGeojson = data.geojson;
+            currentShpB64 = data.shapefile_zip_b64 || null;
+            setStatus(data.geojson.features.length + ' parcels found');
+            showResult(data.geojson);
+            showDownloads();
+        } else if (data.job_id) {
+            // Async response (local server mode) — poll for results
+            currentJobId = data.job_id;
+            setStatus('Processing: ' + file.name);
+            pollJob(data.job_id);
+        } else if (data.error) {
+            setStatus('Failed: ' + data.error);
+        }
+    } catch (err) {
+        setStatus('Error: ' + err.message);
+    }
 }
 
 function pollJob(jobId) {
@@ -101,6 +125,7 @@ function pollJob(jobId) {
 
         if (data.status === 'completed') {
             clearInterval(timer);
+            currentGeojson = data.geojson;
             setStatus(data.geojson.features.length + ' parcels found');
             showResult(data.geojson);
             showDownloads();
@@ -138,7 +163,32 @@ function showResult(gj) {
 function setStatus(msg) { document.getElementById('status').textContent = msg; }
 function showDownloads() { document.querySelectorAll('#downloads button').forEach(b => b.style.display = 'inline-block'); }
 function hideDownloads() { document.querySelectorAll('#downloads button').forEach(b => b.style.display = 'none'); }
-function downloadResult(type) { if (currentJobId) window.open('/api/download/' + currentJobId + '/' + type); }
+
+function downloadResult(type) {
+    if (type === 'geojson' && currentGeojson) {
+        // Client-side download from stored data
+        const blob = new Blob([JSON.stringify(currentGeojson, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'boundary.geojson';
+        a.click();
+        URL.revokeObjectURL(a.href);
+    } else if (type === 'shp' && currentShpB64) {
+        // Client-side download from base64 shapefile
+        const bytes = atob(currentShpB64);
+        const arr = new Uint8Array(bytes.length);
+        for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
+        const blob = new Blob([arr], { type: 'application/zip' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'boundary_shp.zip';
+        a.click();
+        URL.revokeObjectURL(a.href);
+    } else if (currentJobId) {
+        // Fallback to server-side download (local mode)
+        window.open('/api/download/' + currentJobId + '/' + type);
+    }
+}
 </script>
 
 </body>
