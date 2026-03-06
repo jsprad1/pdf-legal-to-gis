@@ -92,8 +92,13 @@ def parse_bearing(text: str) -> Optional[float]:
         N 89°59' W              — degrees + minutes only
         NORTH 89 DEGREES 59' 21" WEST
         N 00°32'59" W           — mangled degree symbols
+        S89'52'17"E             — OCR apostrophe-only (no degree symbol)
         DUE NORTH / NORTHERLY   — cardinal directions
     """
+    # Pre-process: fix common OCR errors (letter O → zero near bearings)
+    text = re.sub(r'(?<=[NSns])\s*([Oo])([Oo])', '00', text)
+    text = re.sub(r'(?<=\d)([Oo])(?=\d)', '0', text)
+
     # Check cardinal bearings first (DUE NORTH, NORTHERLY, etc.)
     cardinal_m = re.search(
         r"\b(DUE\s+(?:NORTH|SOUTH|EAST|WEST)|NORTHERLY|SOUTHERLY|EASTERLY|WESTERLY)\b",
@@ -104,10 +109,16 @@ def parse_bearing(text: str) -> Optional[float]:
         if key in _CARDINAL_AZIMUTHS:
             return _CARDINAL_AZIMUTHS[key]
 
+    # Pre-process: split run-on degree/minute numbers (e.g., S4515′27″E → S45°15′27″E)
+    text = re.sub(
+        r'([NSns])\s*(\d{2})(\d{2})\s*([′\']\s*\d)',
+        r'\1\2°\3\4', text
+    )
+
     # Full DMS pattern: seconds are optional
     pattern = (
         r"(NORTH|SOUTH|N|S)\s*"
-        r"(\d+)\s*(?:DEGREES|DEG\.?|°|~|�)\s*"
+        r"(\d+)\s*(?:DEGREES|DEG\.?|°|~|�|[\'′])\s*"
         r"(\d+)\s*(?:MINUTES|MIN\.?|[\'′])\s*"
         r"(?:(\d+(?:\.\d+)?)\s*(?:SECONDS|SEC\.?|[\"″])?\s*)?"
         r"(EAST|WEST|E|W)"
@@ -632,6 +643,17 @@ def parse_courses_from_text(text: str) -> List[dict]:
         azimuth = parse_bearing(part)
         distance = parse_distance(part)
 
+        # Handle bare cardinal directions with distance (e.g., "EAST, A DISTANCE OF 49.49 FEET")
+        if azimuth is None and distance is not None:
+            cardinal_m = re.match(
+                r"\s*(NORTH|SOUTH|EAST|WEST|NORTHERLY|SOUTHERLY|EASTERLY|WESTERLY)\b",
+                part, re.IGNORECASE,
+            )
+            if cardinal_m:
+                key = cardinal_m.group(1).upper()
+                if key in _CARDINAL_AZIMUTHS:
+                    azimuth = _CARDINAL_AZIMUTHS[key]
+
         if azimuth is not None and distance is not None:
             courses.append({"type": "line", "azimuth": azimuth, "distance": distance})
         elif azimuth is not None:
@@ -999,7 +1021,7 @@ def _gemini_ocr_page(page_image_bytes: bytes) -> str:
         if not client:
             return ""
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-2.5-flash",
             contents=[
                 "Extract ALL text from this scanned document page exactly as written. "
                 "Preserve all numbers, degree symbols (°), minutes ('), seconds (\"), "
@@ -1012,6 +1034,249 @@ def _gemini_ocr_page(page_image_bytes: bytes) -> str:
     except Exception as e:
         print(f"  Gemini OCR failed: {e}")
         return ""
+
+
+def _gemini_vision_extract_courses(pdf_path: Path, verbose: bool = False,
+                                    ocr_text: str = None) -> Optional[dict]:
+    """Use Gemini Pro to extract structured course data from a legal description.
+
+    Strategy: process PDF page-by-page with vision, then combine results.
+    This avoids overwhelming the model with too many pages at once.
+
+    Returns dict with 'commencing_courses' and 'boundary_courses' lists,
+    each in the same format as parse_courses_from_text() output.
+    Returns None on failure.
+    """
+    try:
+        from google.genai import types
+        client = _get_gemini_client()
+        if not client:
+            return None
+
+        doc = fitz.open(pdf_path)
+
+        # Step 1: Identify which pages have legal description content
+        # Send each page for a quick classification
+        legal_pages = []
+        for i, page in enumerate(doc):
+            pix = page.get_pixmap(dpi=150)
+            img_bytes = pix.tobytes("png")
+
+            classify_resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    "Does this page contain surveyor metes-and-bounds courses "
+                    "(bearings like N89°52'17\"E with distances in feet, or curves with radius/arc)? "
+                    "Answer ONLY 'yes' or 'no'.",
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                ],
+            )
+            answer = (classify_resp.text or "").strip().lower()
+            if "yes" in answer:
+                legal_pages.append((i, img_bytes))
+                if verbose:
+                    print(f"  Page {i+1}: contains courses")
+            elif verbose:
+                print(f"  Page {i+1}: no courses")
+
+        if not legal_pages:
+            if verbose:
+                print(f"  No legal description pages found via vision")
+            return None
+
+        # Step 2: Extract courses from each legal page individually
+        all_raw_courses = []
+        meta = {}
+        page_prompt = (
+            "You are an expert surveyor. Extract ALL metes-and-bounds courses from this page.\n\n"
+            "For each course provide:\n"
+            "- type: \"line\" or \"curve\"\n"
+            "- For lines: bearing (e.g. N89°52'17\"E), distance_ft\n"
+            "- For curves: radius_ft, arc_ft, chord_bearing, concave_dir\n\n"
+            "Also extract if visible on this page:\n"
+            "- corner: starting section corner (SW, NE, etc.)\n"
+            "- township, range, section numbers\n"
+            "- is_commencing: true if these courses are BEFORE the Point of Beginning\n\n"
+            "Return ONLY valid JSON array, no markdown:\n"
+            '[{"type":"line","bearing":"S89°52\'17\\"E","distance_ft":4759.39,"is_commencing":false},'
+            '{"type":"curve","radius_ft":1500.0,"arc_ft":234.56,'
+            '"chord_bearing":"S45°30\'00\\"E","concave_dir":"NORTHWESTERLY","is_commencing":false}]\n\n'
+            "If you see township/range/section/corner info, add a first entry like:\n"
+            '{"type":"metadata","corner":"SW","township":35,"range":39,"section":31}'
+        )
+
+        for page_idx, img_bytes in legal_pages:
+            if verbose:
+                print(f"  Extracting courses from page {page_idx+1}...")
+
+            resp = client.models.generate_content(
+                model="gemini-2.5-pro",
+                contents=[
+                    page_prompt,
+                    types.Part.from_bytes(data=img_bytes, mime_type="image/png"),
+                ],
+            )
+
+            resp_text = (resp.text or "").strip()
+            # Extract JSON from markdown code blocks if present
+            json_match = re.search(r'```(?:json)?\s*(\[.*\])\s*```', resp_text, re.DOTALL)
+            if json_match:
+                resp_text = json_match.group(1)
+
+            try:
+                page_courses = json.loads(resp_text)
+                if isinstance(page_courses, list):
+                    for c in page_courses:
+                        if c.get("type") == "metadata":
+                            meta.update(c)
+                        else:
+                            all_raw_courses.append(c)
+                    if verbose:
+                        n = sum(1 for c in page_courses if c.get("type") != "metadata")
+                        print(f"    Got {n} courses from page {page_idx+1}")
+            except json.JSONDecodeError:
+                if verbose:
+                    print(f"    Failed to parse page {page_idx+1} response")
+
+        if not all_raw_courses:
+            return None
+
+        # Step 3: Convert to internal format
+        def _convert_courses(raw_courses):
+            courses = []
+            for c in raw_courses:
+                if c.get("type") == "line":
+                    azimuth = parse_bearing(c.get("bearing", ""))
+                    distance = c.get("distance_ft")
+                    if azimuth is not None and distance:
+                        courses.append({"type": "line", "azimuth": azimuth, "distance": float(distance)})
+                elif c.get("type") == "curve":
+                    chord_bearing = parse_bearing(c.get("chord_bearing", "")) if c.get("chord_bearing") else None
+                    radius = c.get("radius_ft")
+                    arc = c.get("arc_ft")
+                    if radius and arc:
+                        courses.append({
+                            "type": "curve",
+                            "radius": float(radius),
+                            "arc": float(arc),
+                            "direction": "right",
+                            "concave_dir": c.get("concave_dir"),
+                            "chord_bearing": chord_bearing,
+                        })
+            return courses
+
+        commencing = [c for c in all_raw_courses if c.get("is_commencing")]
+        boundary = [c for c in all_raw_courses if not c.get("is_commencing")]
+
+        result = {
+            "commencing_courses": _convert_courses(commencing),
+            "boundary_courses": _convert_courses(boundary),
+            "corner": meta.get("corner"),
+            "township": meta.get("township"),
+            "range": meta.get("range"),
+            "section": meta.get("section"),
+        }
+
+        total = len(result["commencing_courses"]) + len(result["boundary_courses"])
+        if verbose:
+            print(f"  Vision total: {total} courses "
+                  f"({len(result['commencing_courses'])} commencing + "
+                  f"{len(result['boundary_courses'])} boundary)")
+
+        return result if total > 0 else None
+
+    except Exception as e:
+        if verbose:
+            print(f"  Vision extraction failed: {e}")
+        log.warning(f"Gemini vision extraction failed: {e}")
+        return None
+
+
+def _traverse_from_vision(vision_data: dict) -> Optional[dict]:
+    """Build a traverse result from Gemini vision-extracted course data."""
+    twp = vision_data.get("township")
+    rge = vision_data.get("range")
+    sec = vision_data.get("section")
+    corner = vision_data.get("corner", "SW")
+
+    if not all([twp, rge, sec]):
+        return None
+
+    corners = _PLSS_INDEX.get((int(twp), int(rge), int(sec)))
+    if not corners:
+        return None
+
+    # Resolve start point
+    corner = corner.upper()
+    if corner in ("N", "S", "E", "W"):
+        midpoint_map = {
+            "N": ("NW", "NE"), "S": ("SW", "SE"),
+            "E": ("NE", "SE"), "W": ("NW", "SW"),
+        }
+        c1, c2 = midpoint_map[corner]
+        start_lat = (corners[c1][0] + corners[c2][0]) / 2
+        start_lon = (corners[c1][1] + corners[c2][1]) / 2
+    elif corner == "C":
+        start_lat, start_lon = corners["C"]
+    elif corner in corners:
+        start_lat, start_lon = corners[corner]
+    else:
+        start_lat, start_lon = corners.get("SW", corners["C"])
+
+    trav = GeodeticTraverse()
+    lat, lon = start_lat, start_lon
+    legs = []
+    leg_num = 0
+
+    # Commencing courses
+    for c in vision_data["commencing_courses"]:
+        s_lat, s_lon = lat, lon
+        if c["type"] == "line":
+            lat, lon = trav.advance(lat, lon, c["azimuth"], c["distance"])
+        legs.append(_build_leg(leg_num, "commencing", c, s_lat, s_lon, lat, lon))
+        leg_num += 1
+
+    pob_lat, pob_lon = lat, lon
+
+    # Boundary courses
+    points = [(pob_lat, pob_lon)]
+    for i, c in enumerate(vision_data["boundary_courses"]):
+        s_lat, s_lon = lat, lon
+        if c["type"] == "line":
+            lat, lon = trav.advance(lat, lon, c["azimuth"], c["distance"])
+            points.append((lat, lon))
+        elif c["type"] == "curve":
+            arc_points = trav.advance_curve(
+                lat, lon, c["radius"], c["arc"], c["direction"],
+                c.get("chord_bearing"), c.get("concave_dir")
+            )
+            if arc_points:
+                points.extend(arc_points)
+                lat, lon = arc_points[-1]
+        legs.append(_build_leg(leg_num, "boundary", c, s_lat, s_lon, lat, lon))
+        leg_num += 1
+
+    # Closure
+    _, _, closure_m = trav.geod.inv(lon, lat, pob_lon, pob_lat)
+    closure_ft = closure_m / 0.3048
+
+    points = trav.apply_compass_rule(points, pob_lat, pob_lon)
+    coords = [[p[1], p[0]] for p in points]
+    if coords[0] != coords[-1]:
+        coords.append(coords[0])
+    if _ring_is_cw(coords):
+        coords.reverse()
+
+    return {
+        "coordinates": coords,
+        "pob": [pob_lon, pob_lat],
+        "section_ref": f"T{twp}S R{rge}E Sec {sec}",
+        "legs": legs,
+        "closure_ft": round(closure_ft, 2),
+        "num_courses": len(vision_data["boundary_courses"]),
+        "gaps_resolved": 0,
+        "gap_report": [],
+    }
 
 
 def extract_text_from_pdf(pdf_path: Path, verbose: bool = False) -> str:
@@ -1315,6 +1580,33 @@ def process_ordinance(pdf_path: Path, verbose: bool = False) -> dict:
 
             elif parcel["type"] == "metes_and_bounds":
                 result = traverse_metes_bounds(parcel["text"])
+
+                # If regex result is bad (large closure or many gaps), try vision extraction
+                use_vision = False
+                if result and result.get("closure_ft", 0) > 500:
+                    use_vision = True
+                    if verbose:
+                        print(f"  Regex closure too large ({result['closure_ft']} ft), trying vision...")
+                elif not result:
+                    use_vision = True
+                    if verbose:
+                        print(f"  Regex parsing failed, trying vision...")
+
+                if use_vision:
+                    vision_data = _gemini_vision_extract_courses(
+                        pdf_path, verbose=verbose
+                    )
+                    if vision_data:
+                        vision_result = _traverse_from_vision(vision_data)
+                        if vision_result and len(vision_result["coordinates"]) >= 4:
+                            old_closure = result.get("closure_ft", float("inf")) if result else float("inf")
+                            if vision_result["closure_ft"] < old_closure:
+                                if verbose:
+                                    print(f"  Vision improved closure: {old_closure} -> {vision_result['closure_ft']} ft")
+                                result = vision_result
+                            elif verbose:
+                                print(f"  Vision closure ({vision_result['closure_ft']} ft) not better, keeping regex result")
+
                 if result and len(result["coordinates"]) >= 4:
                     props = {
                         "name": doc_name,
@@ -1636,7 +1928,7 @@ def run_web_server():
 # ── Batch Mode ───────────────────────────────────────────────────────────────
 def batch_process():
     """Process all PDFs in ordinances/inbox/, output results, move PDFs to processed/."""
-    pdfs = sorted(INBOX.glob("*.pdf")) + sorted(INBOX.glob("*.PDF"))
+    pdfs = sorted(set(INBOX.glob("*.pdf")) | set(INBOX.glob("*.PDF")))
     if not pdfs:
         print("No PDFs found in ordinances/inbox/")
         return
@@ -1696,7 +1988,7 @@ def batch_process():
             dest = PROCESSED / pdf_path.name
             shutil.move(str(pdf_path), str(dest))
 
-            print(f"  SUCCESS: {len(geojson['features'])} features → {out_dir}")
+            print(f"  SUCCESS: {len(geojson['features'])} features -> {out_dir}")
             print(f"  PDF moved to ordinances/processed/")
 
         except Exception as e:

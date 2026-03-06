@@ -39,6 +39,14 @@ and outputs GIS boundary files (GeoJSON, Shapefile) with a map preview.
     └── TECHNICAL_SPEC.md     # Detailed technical specification
 ```
 
+## Active Plan
+**READ `PLAN.md` AT START OF SESSION.** It contains the next steps:
+- Build human-in-the-loop review UI (editable legs table + live map + source page images)
+- Clean up project (remove old job output, dead files)
+- Redeploy to Vercel after changes
+- GitHub repo: https://github.com/jsprad1/pdf-legal-to-gis
+- Vercel app: https://cdds.vercel.app
+
 ## Technical Spec
 See `docs/TECHNICAL_SPEC.md` for the full technical specification including:
 - Processing pipeline details (text extraction, parcel detection, traverse engine)
